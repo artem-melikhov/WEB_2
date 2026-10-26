@@ -2,102 +2,51 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 public class WorkerPool {
-    private static volatile boolean running = true;
+    private static Process startWorker(int number, int port, Path directory) throws IOException {
+        String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        ProcessBuilder builder = new ProcessBuilder(java,
+                "-Dfile.encoding=UTF-8", "-DFCGI_PORT=" + port,
+                "-cp", System.getProperty("java.class.path"), "Main");
+        builder.redirectErrorStream(true);
+        builder.redirectOutput(ProcessBuilder.Redirect.appendTo(directory.resolve("java-" + number + ".log").toFile()));
 
-    private static class Worker implements Runnable {
-        final int number;
-        final int port;
-        final Path directory;
-        Process process;
-
-        Worker(int number, int port, Path directory) {
-            this.number = number;
-            this.port = port;
-            this.directory = directory;
+        Process process = builder.start();
+        try {
+            Files.writeString(directory.resolve("java-" + number + ".pid"), Long.toString(process.pid()));
+        } catch (IOException error) {
+            stop(process);
+            throw error;
         }
+        System.out.println("Java " + number + " запущена на порту " + port + ", PID " + process.pid());
+        return process;
+    }
 
-        @Override
-        public void run() {
-            Path log = directory.resolve("java-" + number + ".log");
-            Path pidFile = directory.resolve("java-" + number + ".pid");
-
-            while (running) {
-                Process child = null;
-                try {
-                    String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-                    ProcessBuilder builder = new ProcessBuilder(java,
-                            "-Dfile.encoding=UTF-8", "-DFCGI_PORT=" + port,
-                            "-cp", System.getProperty("java.class.path"), "Main");
-                    builder.redirectErrorStream(true);
-                    builder.redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile()));
-
-                    child = builder.start();
-                    synchronized (this) {
-                        if (!running) {
-                            return;
-                        }
-                        process = child;
-                    }
-                    Files.writeString(pidFile, Long.toString(child.pid()));
-                    System.out.println("Java " + number + " запущена на порту " + port + ", PID " + child.pid());
-
-                    int exitCode = child.waitFor();
-                    if (running) {
-                        System.out.println("Java " + number + " завершилась (код " + exitCode + "), перезапуск через секунду");
-                    }
-                } catch (IOException error) {
-                    System.err.println("Не удалось запустить Java " + number + ": " + error.getMessage());
-                } catch (InterruptedException error) {
-                    Thread.currentThread().interrupt();
-                    return;
-                } finally {
-                    if (child != null && child.isAlive()) {
-                        stopProcess(child);
-                    }
-                    synchronized (this) {
-                        process = null;
-                    }
-                    try {
-                        Files.deleteIfExists(pidFile);
-                    } catch (IOException error) {
-                        System.err.println("Не удалось удалить " + pidFile + ": " + error.getMessage());
-                    }
-                }
-
-                if (running) {
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException error) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    }
-                }
-            }
+    private static void stop(Process process) {
+        if (process == null || !process.isAlive()) {
+            return;
         }
-
-        void stop() {
-            Process child;
-            synchronized (this) {
-                child = process;
+        process.destroy();
+        try {
+            if (!process.waitFor(3, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                process.waitFor(3, TimeUnit.SECONDS);
             }
-            if (child == null) {
-                return;
-            }
-            stopProcess(child);
+        } catch (InterruptedException error) {
+            process.destroyForcibly();
+            Thread.currentThread().interrupt();
         }
+    }
 
-        private void stopProcess(Process child) {
-            child.destroy();
+    private static void deletePidFiles(Path directory) {
+        for (int number = 1; number <= 2; number++) {
             try {
-                if (!child.waitFor(3, TimeUnit.SECONDS)) {
-                    child.destroyForcibly();
-                    child.waitFor(3, TimeUnit.SECONDS);
-                }
-            } catch (InterruptedException error) {
-                Thread.currentThread().interrupt();
+                Files.deleteIfExists(directory.resolve("java-" + number + ".pid"));
+            } catch (IOException error) {
+                System.err.println("Не удалось удалить PID-файл Java " + number + ": " + error.getMessage());
             }
         }
     }
@@ -116,22 +65,29 @@ public class WorkerPool {
         Files.createDirectories(directory);
         try (ServerSocket firstSocket = new ServerSocket(firstPort);
              ServerSocket secondSocket = new ServerSocket(firstPort + 1)) {
-            // Проверяем оба порта до запуска процессов.
+            // Проверяем, что оба порта свободны.
         }
-        Worker first = new Worker(1, firstPort, directory);
-        Worker second = new Worker(2, firstPort + 1, directory);
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            running = false;
-            first.stop();
-            second.stop();
-        }));
+        Process first = null;
+        Process second = null;
+        try {
+            first = startWorker(1, firstPort, directory);
+            second = startWorker(2, firstPort + 1, directory);
 
-        Thread firstWatcher = new Thread(first);
-        Thread secondWatcher = new Thread(second);
-        firstWatcher.start();
-        secondWatcher.start();
-        firstWatcher.join();
-        secondWatcher.join();
+            Process firstWorker = first;
+            Process secondWorker = second;
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                stop(firstWorker);
+                stop(secondWorker);
+                deletePidFiles(directory);
+            }));
+
+            CompletableFuture.anyOf(first.onExit(), second.onExit()).join();
+            throw new IllegalStateException("Один из процессов Java завершился. Запустите WorkerPool снова.");
+        } finally {
+            stop(first);
+            stop(second);
+            deletePidFiles(directory);
+        }
     }
 }
